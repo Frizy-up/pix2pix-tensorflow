@@ -20,13 +20,21 @@ edge_pool = None
 parser = argparse.ArgumentParser()
 parser.add_argument("--input_dir", required=True, help="path to folder containing images")
 parser.add_argument("--output_dir", required=True, help="output path")
-parser.add_argument("--operation", required=True, choices=["grayscale", "resize", "blank", "combine", "edges"])
+
+# Frizy add --operation combine_MultiView
+parser.add_argument("--operation", required=True, choices=["grayscale", "resize", "blank", "combine", "combine_MultiView", "edges"])
+
+
 parser.add_argument("--workers", type=int, default=1, help="number of workers")
 # resize
 parser.add_argument("--pad", action="store_true", help="pad instead of crop for resize operation")
 parser.add_argument("--size", type=int, default=256, help="size to use for resize operation")
 # combine
 parser.add_argument("--b_dir", type=str, help="path to folder containing B images for combine operation")
+
+# Frizy add for MultiViews combine
+parser.add_argument("--c_dir", type=str, help="path to folder containing C images for combine operation")
+
 a = parser.parse_args()
 
 
@@ -105,6 +113,72 @@ def combine(src, src_path):
         sibling = sibling[:,:,:3]
 
     return np.concatenate([src, sibling], axis=1)
+
+
+# Frizy : add for combine multi-view
+def combine_MultiView(src, src_path):
+    if a.b_dir is None:
+        raise Exception("missing b_dir")
+
+    if a.c_dir is None:
+        raise Exception("missing c_dir")
+
+    # find corresponding file in b_dir, could have a different extension
+    basename, _ = os.path.splitext(os.path.basename(src_path))
+
+    basename_c = basename
+
+    # Frizy : added
+    basename_right = basename.replace('left','right')
+    basename_right = basename_right.rsplit('_',1)
+    basename_right = basename_right[0] + '_1'
+
+    for ext in [".png", ".jpg"]:
+        sibling_path = os.path.join(a.b_dir, basename_right + ext)
+        if os.path.exists(sibling_path):
+            sibling = im.load(sibling_path)
+            break
+        else:
+            raise Exception("could not find sibling image for " + src_path)
+
+    for ext in [".png", ".jpg"]:
+        sibling_path_c = os.path.join(a.c_dir, basename_c + ext)
+        if os.path.exists(sibling_path_c):
+            sibling_c = im.load(sibling_path_c)
+            break
+        else:
+            raise Exception("could not find sibling_c image for " + src_path)
+
+    # make sure that dimensions are correct
+    height, width, _ = src.shape
+    if height != sibling.shape[0] or width != sibling.shape[1]:
+        raise Exception("differing sizes")
+
+    if height != sibling_c.shape[0] or width != sibling_c.shape[1]:
+        raise Exception("differing sizes")
+
+    # convert both images to RGB if necessary
+    if src.shape[2] == 1:
+        src = im.grayscale_to_rgb(images=src)
+
+    if sibling.shape[2] == 1:
+        sibling = im.grayscale_to_rgb(images=sibling)
+
+    if sibling_c.shape[2] == 1:
+        sibling_c = im.grayscale_to_rgb(images=sibling_c)
+
+    # remove alpha channel
+    if src.shape[2] == 4:
+        src = src[:, :, :3]
+
+    if sibling.shape[2] == 4:
+        sibling = sibling[:, :, :3]
+
+    if sibling_c.shape[2] == 4:
+        sibling_c = sibling_c[:, :, :3]
+
+    return np.concatenate([src, sibling, sibling_c], axis=1)
+
 
 
 def grayscale(src):
@@ -200,6 +274,11 @@ def process(src_path, dst_path):
         dst = blank(src)
     elif a.operation == "combine":
         dst = combine(src, src_path)
+
+    # Frizy : add for combine_MultiView
+    elif a.operation == "combine_MultiView":
+        dst = combine_MultiView(src, src_path)
+
     elif a.operation == "edges":
         dst = edges(src)
     else:
