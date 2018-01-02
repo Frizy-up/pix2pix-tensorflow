@@ -1,0 +1,1 @@
+--mode train  --output_dir /home/lab/Program-opt/MultiCamera/DataSet-Mul/trainData/L256-R256-L256BK-combine-no_gen_loss-train  --gan_weight=0  --max_epochs 500  --input_dir /home/lab/Program-opt/MultiCamera/DataSet-Mul/trainData/L256-R256-L256BK-combine/train
