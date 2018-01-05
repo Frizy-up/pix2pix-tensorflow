@@ -587,7 +587,7 @@ def save_images(fetches, step=None):
     for i, in_path in enumerate(fetches["paths"]):
         name, _ = os.path.splitext(os.path.basename(in_path.decode("utf8")))
         fileset = {"name": name, "step": step}
-        for kind in ["inputs", "stns", "outputs", "targets"]:
+        for kind in ["inputs", "stns", "outputs", "targets", "conditions"]:
             filename = name + "-" + kind + ".png"
             if step is not None:
                 filename = "%08d-%s" % (step, filename)
@@ -746,6 +746,7 @@ def main():
         targets = deprocess(examples.targets)
         outputs = deprocess(model.outputs)
         stn_de = deprocess(model.STN)
+        conditions = deprocess(examples.conditions)
 
     def convert(image):
         if a.aspect_ratio != 1.0:
@@ -768,6 +769,10 @@ def main():
     with tf.name_scope("convert_stn"):
         converted_stns = convert(stn_de)
 
+    with tf.name_scope("convert_conditions"):
+        converted_conditions = convert(conditions)
+
+
     with tf.name_scope("encode_images"):
         display_fetches = {
             "paths": examples.paths,
@@ -775,6 +780,7 @@ def main():
             "targets": tf.map_fn(tf.image.encode_png, converted_targets, dtype=tf.string, name="target_pngs"),
             "outputs": tf.map_fn(tf.image.encode_png, converted_outputs, dtype=tf.string, name="output_pngs"),
             "stns": tf.map_fn(tf.image.encode_png, converted_stns, dtype=tf.string, name="stn_pngs"),
+            "conditions": tf.map_fn(tf.image.encode_png, converted_conditions, dtype=tf.string, name="conditions_pngs"),
         }
 
     # summaries
