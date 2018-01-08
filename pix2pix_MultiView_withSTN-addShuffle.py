@@ -13,6 +13,8 @@ import collections
 import math
 import time
 
+from spatial_transformer import transformer
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--input_dir", help="path to folder containing images")
 parser.add_argument("--mode", required=True, choices=["train", "test", "export"])
@@ -25,12 +27,12 @@ parser.add_argument("--max_epochs", type=int, help="number of training epochs")
 parser.add_argument("--summary_freq", type=int, default=100, help="update summaries every summary_freq steps")
 parser.add_argument("--progress_freq", type=int, default=50, help="display progress every progress_freq steps")
 parser.add_argument("--trace_freq", type=int, default=0, help="trace execution every trace_freq steps")
-parser.add_argument("--display_freq", type=int, default=0, help="write current training images every display_freq steps")
+parser.add_argument("--display_freq", type=int, default=100, help="write current training images every display_freq steps")
 parser.add_argument("--save_freq", type=int, default=5000, help="save model every save_freq steps, 0 to disable")
 
 parser.add_argument("--aspect_ratio", type=float, default=1.0, help="aspect ratio of output images (width/height)")
 parser.add_argument("--lab_colorization", action="store_true", help="split input image into brightness (A) and color (B)")
-parser.add_argument("--batch_size", type=int, default=1, help="number of images in batch")
+parser.add_argument("--batch_size", type=int, default=16, help="number of images in batch")
 parser.add_argument("--which_direction", type=str, default="AtoB", choices=["AtoB", "BtoA"])
 parser.add_argument("--ngf", type=int, default=64, help="number of generator filters in first conv layer")
 parser.add_argument("--ndf", type=int, default=64, help="number of discriminator filters in first conv layer")
@@ -40,7 +42,7 @@ parser.add_argument("--no_flip", dest="flip", action="store_false", help="don't 
 parser.set_defaults(flip=False)
 parser.add_argument("--lr", type=float, default=0.0002, help="initial learning rate for adam")
 parser.add_argument("--beta1", type=float, default=0.5, help="momentum term of adam")
-parser.add_argument("--l1_weight", type=float, default=100.0, help="weight on L1 term for generator gradient")
+parser.add_argument("--l1_weight", type=float, default=200.0, help="weight on L1 term for generator gradient")
 parser.add_argument("--gan_weight", type=float, default=1.0, help="weight on GAN term for generator gradient")
 
 # export options
@@ -50,8 +52,8 @@ a = parser.parse_args()
 EPS = 1e-12
 CROP_SIZE = 256
 
-Examples = collections.namedtuple("Examples", "paths, inputs, targets, count, steps_per_epoch")
-Model = collections.namedtuple("Model", "outputs, predict_real, predict_fake, discrim_loss, discrim_grads_and_vars, gen_loss_GAN, gen_loss_L1, gen_grads_and_vars, train")
+Examples = collections.namedtuple("Examples", "paths, inputs, targets, conditions, count, steps_per_epoch")
+Model = collections.namedtuple("Model", "outputs, predict_real, predict_fake, discrim_loss, discrim_grads_and_vars, gen_loss_GAN, gen_loss_L1, gen_grads_and_vars, train, STN")
 
 
 def preprocess(image):
@@ -90,15 +92,45 @@ def augment(image, brightness):
     return rgb
 
 
-def conv(batch_input, out_channels, stride):
+def conv(batch_input, out_channels, stride,filter_w=4, padding=1):
     with tf.variable_scope("conv"):
         in_channels = batch_input.get_shape()[3]
-        filter = tf.get_variable("filter", [4, 4, in_channels, out_channels], dtype=tf.float32, initializer=tf.random_normal_initializer(0, 0.02))
+        filter = tf.get_variable("filter", [filter_w, filter_w, in_channels, out_channels], dtype=tf.float32, initializer=tf.random_normal_initializer(0, 0.02))
         # [batch, in_height, in_width, in_channels], [filter_width, filter_height, in_channels, out_channels]
         #     => [batch, out_height, out_width, out_channels]
-        padded_input = tf.pad(batch_input, [[0, 0], [1, 1], [1, 1], [0, 0]], mode="CONSTANT")
+        padded_input = tf.pad(batch_input, [[0, 0], [padding, padding], [padding, padding], [0, 0]], mode="CONSTANT")
         conv = tf.nn.conv2d(padded_input, filter, [1, stride, stride, 1], padding="VALID")
         return conv
+
+def channel_shuffle(name, x, num_groups=2):
+    with tf.variable_scope(name) as scope:
+        n, h, w, c = x.shape.as_list()
+        x_reshaped = tf.reshape(x, [-1, h, w, num_groups, c//num_groups])
+        x_transposed = tf.transpose(x_reshaped, [0, 1, 2, 4, 3])
+        output = tf.reshape(x_transposed, [-1, h, w, c])
+        return output
+
+
+def shuffleConv(batch_input, out_channels, stride,filter_w=4, padding=1):
+    with tf.variable_scope("conv"):
+        in_channels = batch_input.get_shape()[3]
+        in_channels_sz = in_channels//2
+        out_channels_sz = out_channels//2
+
+        padded_input = tf.pad(batch_input, [[0, 0], [padding, padding], [padding, padding], [0, 0]], mode="CONSTANT")
+
+        filter_1 = tf.get_variable("filter_1", [filter_w, filter_w, in_channels_sz, out_channels_sz], dtype=tf.float32, initializer=tf.random_normal_initializer(0, 0.02))
+        conv_1 = tf.nn.conv2d(padded_input[:,:,:,0:in_channels_sz], filter_1, [1, stride, stride, 1], padding="VALID")
+
+        filter_2 = tf.get_variable("filter_2", [filter_w, filter_w, in_channels_sz, out_channels_sz], dtype=tf.float32,
+                                   initializer=tf.random_normal_initializer(0, 0.02))
+        conv_2 = tf.nn.conv2d(padded_input[:, :, :, in_channels_sz:in_channels], filter_2, [1, stride, stride, 1],
+                              padding="VALID")
+
+        conv_g = tf.concat([conv_1, conv_2],axis=-1)
+        conv_sf = channel_shuffle('channel_shuffle', conv_g, num_groups=2)
+
+        return conv_sf
 
 
 def lrelu(x, a):
@@ -135,6 +167,30 @@ def deconv(batch_input, out_channels):
         #     => [batch, out_height, out_width, out_channels]
         conv = tf.nn.conv2d_transpose(batch_input, filter, [batch, in_height * 2, in_width * 2, out_channels], [1, 2, 2, 1], padding="SAME")
         return conv
+
+def ShuffleDeconv(batch_input, out_channels):
+    with tf.variable_scope("deconv"):
+        batch, in_height, in_width, in_channels = [int(d) for d in batch_input.get_shape()]
+        in_channels_sz = in_channels // 2
+        out_channels_sz = out_channels // 2
+
+        filter_1 = tf.get_variable("filter_1", [4, 4, out_channels_sz, in_channels_sz], dtype=tf.float32, initializer=tf.random_normal_initializer(0, 0.02))
+        # [batch, in_height, in_width, in_channels], [filter_width, filter_height, out_channels, in_channels]
+        #     => [batch, out_height, out_width, out_channels]
+        conv_1 = tf.nn.conv2d_transpose(batch_input[:,:,:,0:in_channels_sz], filter_1, [batch, in_height * 2, in_width * 2, out_channels_sz], [1, 2, 2, 1], padding="SAME")
+
+        filter_2 = tf.get_variable("filter_2", [4, 4, out_channels_sz, in_channels_sz], dtype=tf.float32,
+                                   initializer=tf.random_normal_initializer(0, 0.02))
+        # [batch, in_height, in_width, in_channels], [filter_width, filter_height, out_channels, in_channels]
+        #     => [batch, out_height, out_width, out_channels]
+        conv_2 = tf.nn.conv2d_transpose(batch_input[:, :, :, in_channels_sz:in_channels], filter_2,
+                                        [batch, in_height * 2, in_width * 2, out_channels_sz], [1, 2, 2, 1],
+                                        padding="SAME")
+
+        conv_g = tf.concat([conv_1, conv_2], axis=-1)
+        conv_sf = channel_shuffle('channel_shuffle', conv_g, num_groups=2)
+
+        return conv_sf
 
 
 def check_image(image):
@@ -235,6 +291,7 @@ def lab_to_rgb(lab):
         return tf.reshape(srgb_pixels, tf.shape(lab))
 
 
+
 def load_examples():
     if a.input_dir is None or not os.path.exists(a.input_dir):
         raise Exception("input_dir does not exist")
@@ -278,16 +335,23 @@ def load_examples():
             L_chan, a_chan, b_chan = preprocess_lab(lab)
             a_images = tf.expand_dims(L_chan, axis=2)
             b_images = tf.stack([a_chan, b_chan], axis=2)
+            c_images = a_images
         else:
             # break apart image pair and move to range [-1, 1]
             width = tf.shape(raw_input)[1] # [height, width, channels]
-            a_images = preprocess(raw_input[:,:width//2,:])
-            b_images = preprocess(raw_input[:,width//2:,:])
+            a_images_raw = raw_input[:,:width//3,:]
+            b_images_raw = raw_input[:,width//3:2*width//3,:]
+            c_images_raw = raw_input[:,2*width//3:,:]
+
+            a_images = preprocess(a_images_raw)
+            b_images = preprocess(b_images_raw)
+            c_images = preprocess(c_images_raw)
+
 
     if a.which_direction == "AtoB":
-        inputs, targets = [a_images, b_images]
+        targets, condition, inputs = [a_images, b_images, c_images]
     elif a.which_direction == "BtoA":
-        inputs, targets = [b_images, a_images]
+        targets, condition, inputs = [b_images, a_images, c_images]
     else:
         raise Exception("invalid direction")
 
@@ -316,24 +380,99 @@ def load_examples():
     with tf.name_scope("target_images"):
         target_images = transform(targets)
 
-    paths_batch, inputs_batch, targets_batch = tf.train.batch([paths, input_images, target_images], batch_size=a.batch_size)
+    with tf.name_scope("condition_images"):
+        condition_images = transform(condition)
+
+    paths_batch, inputs_batch, targets_batch, conditions_batch = tf.train.batch([paths, input_images, target_images, condition_images], batch_size=a.batch_size)
     steps_per_epoch = int(math.ceil(len(input_paths) / a.batch_size))
 
     return Examples(
         paths=paths_batch,
         inputs=inputs_batch,
         targets=targets_batch,
+        conditions=conditions_batch,
         count=len(input_paths),
         steps_per_epoch=steps_per_epoch,
     )
 
 
 def create_generator(generator_inputs, generator_outputs_channels):
+    # Frizy add : STN
+    with tf.variable_scope("stn"):
+
+        conditions = generator_inputs[:,:,:,0:3]
+        inputs = generator_inputs[:,:,:,3:6]
+
+        # 256,3-->64,24
+        with tf.variable_scope("loc_conv_1"):
+            location_1 = conv(conditions,24,stride=4,padding=0)
+            bm_1 = batchnorm(location_1)
+            rectified_1 = lrelu(bm_1, 0.2)
+
+        # 64,24-->16,96
+        with tf.variable_scope("loc_conv_2"):
+            location_2 = conv(rectified_1, 96, stride=4,padding=0)
+            bm_2 = batchnorm(location_2)
+            rectified_2 = lrelu(bm_2, 0.2)
+
+        # 16,96-->4,512
+        with tf.variable_scope("loc_conv_3"):
+            location_3 = conv(rectified_2, 512, stride=4,padding=0)
+            bm_3 = batchnorm(location_3)
+            rectified_3 = lrelu(bm_3, 0.2)
+
+        # 4,512-->1,1024
+        with tf.variable_scope("loc_conv_4"):
+            location_4 = conv(rectified_3, 1024, stride=4, padding=0)
+            bm_4 = batchnorm(location_4)
+            rectified_4 = lrelu(bm_4, 0.2)
+
+
+        def weight_variable(shape):
+            initial = tf.zeros(shape)
+            return tf.Variable(initial)
+
+        def bias_variable(shape):
+            initial = tf.random_normal(shape,mean=0.0,stddev=0.01)
+            return tf.Variable(initial)
+
+        if a.mode == "train":
+            keep_prob = 0.8
+        else:
+            keep_prob = 1.0
+
+
+        conv1024 = tf.reshape(rectified_4,[-1,1024])
+
+        # 1,1024-->20
+        with tf.variable_scope("loc_fullconnect_1"):
+            W_fc_1 = weight_variable([1024,20])
+            b_fc_1 = bias_variable([20])
+            h_fc_1 = tf.nn.tanh(tf.matmul(conv1024, W_fc_1)+b_fc_1)
+            h_fc_1_drop = tf.nn.dropout(h_fc_1,keep_prob)
+
+        # 20-->6
+        with tf.variable_scope("loc_fullconnect_2"):
+            W_fc_2 = weight_variable([20, 6])
+            initial = np.array([[1.,0,0],[0,1.,0]])
+            initial = initial.astype('float32')
+            initial = initial.flatten()
+            b_fc_2 = tf.Variable(initial_value=initial,name='b_fc_2')
+
+            h_fc_2 = tf.nn.tanh(tf.matmul(h_fc_1_drop, W_fc_2) + b_fc_2)
+
+
+        conditions_stn = transformer(conditions,h_fc_2,out_size=(256,256))
+
+    generator_inputs_stn = tf.concat([conditions_stn, inputs], axis=3)
+
+    generator_inputs_stn_reshape = tf.reshape(generator_inputs_stn,[a.batch_size,256,256,6])
+
     layers = []
 
     # encoder_1: [batch, 256, 256, in_channels] => [batch, 128, 128, ngf]
     with tf.variable_scope("encoder_1"):
-        output = conv(generator_inputs, a.ngf, stride=2)
+        output = conv(generator_inputs_stn_reshape, a.ngf, stride=2)
         layers.append(output)
 
     layer_specs = [
@@ -346,13 +485,21 @@ def create_generator(generator_inputs, generator_outputs_channels):
         a.ngf * 8, # encoder_8: [batch, 2, 2, ngf * 8] => [batch, 1, 1, ngf * 8]
     ]
 
+    i = 0
+    n = len(layer_specs)
     for out_channels in layer_specs:
         with tf.variable_scope("encoder_%d" % (len(layers) + 1)):
             rectified = lrelu(layers[-1], 0.2)
             # [batch, in_height, in_width, in_channels] => [batch, in_height/2, in_width/2, out_channels]
-            convolved = conv(rectified, out_channels, stride=2)
+            convolved = shuffleConv(rectified, out_channels, stride=2)
             output = batchnorm(convolved)
-            layers.append(output)
+            i = i + 1
+            if i == n :
+                with tf.variable_scope("NIN"):
+                    convNIN = conv(output,out_channels,stride=1,filter_w=1,padding=0)
+                    layers.append(convNIN)
+            else:
+                layers.append(output)
 
     layer_specs = [
         (a.ngf * 8, 0.5),   # decoder_8: [batch, 1, 1, ngf * 8] => [batch, 2, 2, ngf * 8 * 2]
@@ -393,16 +540,17 @@ def create_generator(generator_inputs, generator_outputs_channels):
         output = tf.tanh(output)
         layers.append(output)
 
-    return layers[-1]
+
+    return layers[-1], conditions_stn
 
 
-def create_model(inputs, targets):
-    def create_discriminator(discrim_inputs, discrim_targets):
+def create_model(inputs, targets, conditions):
+    def create_discriminator(discrim_conditions, discrim_targets):
         n_layers = 3
         layers = []
 
         # 2x [batch, height, width, in_channels] => [batch, height, width, in_channels * 2]
-        input = tf.concat([discrim_inputs, discrim_targets], axis=3)
+        input = tf.concat([discrim_conditions, discrim_targets], axis=3)
 
         # layer_1: [batch, 256, 256, in_channels * 2] => [batch, 128, 128, ndf]
         with tf.variable_scope("layer_1"):
@@ -411,12 +559,12 @@ def create_model(inputs, targets):
             layers.append(rectified)
 
         # layer_2: [batch, 128, 128, ndf] => [batch, 64, 64, ndf * 2]
-        # layer_3: [batch, 64, 64, ndf * 2] => [batch, 32, 32, ndf * 4]
-        # layer_4: [batch, 32, 32, ndf * 4] => [batch, 31, 31, ndf * 8]
+        # layer_3: [batch, 64, 64, ndf * 2] => [batch, 64, 64, ndf * 4]
+        # layer_4: [batch, 64, 64, ndf * 4] => [batch, 64, 64, ndf * 8]
         for i in range(n_layers):
             with tf.variable_scope("layer_%d" % (len(layers) + 1)):
                 out_channels = a.ndf * min(2**(i+1), 8)
-                stride = 1 if i == n_layers - 1 else 2  # last layer here has stride 1
+                stride = 1 if i == n_layers - 1 or i==n_layers-2 else 2  # last two layer here has stride 1
                 convolved = conv(layers[-1], out_channels, stride=stride)
                 normalized = batchnorm(convolved)
                 rectified = lrelu(normalized, 0.2)
@@ -432,19 +580,20 @@ def create_model(inputs, targets):
 
     with tf.variable_scope("generator") as scope:
         out_channels = int(targets.get_shape()[-1])
-        outputs = create_generator(inputs, out_channels)
+        gen_inputs = tf.concat([conditions, inputs], axis=3)
+        outputs, stn = create_generator(gen_inputs, out_channels)
 
     # create two copies of discriminator, one for real pairs and one for fake pairs
     # they share the same underlying variables
     with tf.name_scope("real_discriminator"):
         with tf.variable_scope("discriminator"):
-            # 2x [batch, height, width, channels] => [batch, 30, 30, 1]
-            predict_real = create_discriminator(inputs, targets)
+            # 2x [batch, height, width, channels] => [batch, 64, 64, 1]
+            predict_real = create_discriminator(conditions, targets)
 
     with tf.name_scope("fake_discriminator"):
         with tf.variable_scope("discriminator", reuse=True):
-            # 2x [batch, height, width, channels] => [batch, 30, 30, 1]
-            predict_fake = create_discriminator(inputs, outputs)
+            # 2x [batch, height, width, channels] => [batch, 64, 64, 1]
+            predict_fake = create_discriminator(conditions, outputs)
 
     with tf.name_scope("discriminator_loss"):
         # minimizing -tf.log will try to get inputs to 1
@@ -488,6 +637,7 @@ def create_model(inputs, targets):
         gen_grads_and_vars=gen_grads_and_vars,
         outputs=outputs,
         train=tf.group(update_losses, incr_global_step, gen_train),
+        STN=stn,
     )
 
 
@@ -500,7 +650,7 @@ def save_images(fetches, step=None):
     for i, in_path in enumerate(fetches["paths"]):
         name, _ = os.path.splitext(os.path.basename(in_path.decode("utf8")))
         fileset = {"name": name, "step": step}
-        for kind in ["inputs", "outputs", "targets"]:
+        for kind in ["inputs", "stns", "outputs", "targets", "conditions"]:
             filename = name + "-" + kind + ".png"
             if step is not None:
                 filename = "%08d-%s" % (step, filename)
@@ -634,7 +784,7 @@ def main():
     print("examples count = %d" % examples.count)
 
     # inputs and targets are [batch_size, height, width, channels]
-    model = create_model(examples.inputs, examples.targets)
+    model = create_model(examples.inputs, examples.targets, examples.conditions)
 
     # undo colorization splitting on images that we use for display/output
     if a.lab_colorization:
@@ -651,12 +801,15 @@ def main():
             inputs = augment(examples.inputs, examples.targets)
             targets = deprocess(examples.targets)
             outputs = deprocess(model.outputs)
+
         else:
             raise Exception("invalid direction")
     else:
         inputs = deprocess(examples.inputs)
         targets = deprocess(examples.targets)
         outputs = deprocess(model.outputs)
+        stn_de = deprocess(model.STN)
+        conditions = deprocess(examples.conditions)
 
     def convert(image):
         if a.aspect_ratio != 1.0:
@@ -676,12 +829,21 @@ def main():
     with tf.name_scope("convert_outputs"):
         converted_outputs = convert(outputs)
 
+    with tf.name_scope("convert_stn"):
+        converted_stns = convert(stn_de)
+
+    with tf.name_scope("convert_conditions"):
+        converted_conditions = convert(conditions)
+
+
     with tf.name_scope("encode_images"):
         display_fetches = {
             "paths": examples.paths,
             "inputs": tf.map_fn(tf.image.encode_png, converted_inputs, dtype=tf.string, name="input_pngs"),
             "targets": tf.map_fn(tf.image.encode_png, converted_targets, dtype=tf.string, name="target_pngs"),
             "outputs": tf.map_fn(tf.image.encode_png, converted_outputs, dtype=tf.string, name="output_pngs"),
+            "stns": tf.map_fn(tf.image.encode_png, converted_stns, dtype=tf.string, name="stn_pngs"),
+            "conditions": tf.map_fn(tf.image.encode_png, converted_conditions, dtype=tf.string, name="conditions_pngs"),
         }
 
     # summaries
