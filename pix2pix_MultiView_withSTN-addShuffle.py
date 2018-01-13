@@ -570,7 +570,7 @@ def create_model(inputs, targets, conditions):
                 rectified = lrelu(normalized, 0.2)
                 layers.append(rectified)
 
-        # layer_5: [batch, 31, 31, ndf * 8] => [batch, 30, 30, 1]
+        # layer_5: [batch, 64, 64, ndf * 8] => [batch, 64, 64, 1]
         with tf.variable_scope("layer_%d" % (len(layers) + 1)):
             convolved = conv(rectified, out_channels=1, stride=1)
             output = tf.sigmoid(convolved)
