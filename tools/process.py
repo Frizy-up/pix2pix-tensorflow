@@ -14,6 +14,8 @@ import threading
 import time
 import multiprocessing
 
+import cv2
+
 edge_pool = None
 
 
@@ -22,7 +24,7 @@ parser.add_argument("--input_dir", required=True, help="path to folder containin
 parser.add_argument("--output_dir", required=True, help="output path")
 
 # Frizy add --operation combine_MultiView
-parser.add_argument("--operation", required=True, choices=["grayscale", "resize", "blank", "combine", "combine_MultiView", "edges"])
+parser.add_argument("--operation", required=True, choices=["grayscale", "resize", "blank", "combine", "combine_MultiView", "edges", "damage_random"])
 
 
 parser.add_argument("--workers", type=int, default=1, help="number of workers")
@@ -77,6 +79,7 @@ def blank(src):
     dst = src
     dst[offset:offset + size,offset:offset + size,:] = np.ones([size, size, 3])
     return dst
+
 
 
 def combine(src, src_path):
@@ -287,6 +290,38 @@ def process(src_path, dst_path):
     im.save(dst, dst_path)
 
 
+def damageImage(image):
+    height = image.shape[0]
+    width = image.shape[1]
+
+    p1x = np.random.randint(0, width)
+    p1y = np.random.randint(0, height)
+
+    p2x = np.random.randint(0, width)
+    p2y = np.random.randint(0, height)
+
+    p3x = np.random.randint(0, width)
+    p3y = np.random.randint(0, height)
+
+    p4x = np.random.randint(0, width)
+    p4y = np.random.randint(0, height)
+
+    points = np.array([[[p1x, p1y], [p2x, p2y], [p3x, p3y], [p4x, p4y]]])
+
+    color = np.array([np.random.randint(0, 255), np.random.randint(0, 255), np.random.randint(0, 255)])
+
+    cv2.fillConvexPoly(image, points, color)
+
+
+def process_damage_random(src_path, dst_path):
+    src = cv2.imread(src_path)
+
+    damageImage(src)
+
+    cv2.imwrite(dst_path, src)
+
+
+
 complete_lock = threading.Lock()
 start = None
 num_complete = 0
@@ -346,7 +381,10 @@ def main():
     if a.workers == 1:
         with tf.Session() as sess:
             for src_path, dst_path in zip(src_paths, dst_paths):
-                process(src_path, dst_path)
+                if a.operation == "damage_random":
+                    process_damage_random(src_path, dst_path)
+                else:
+                    process(src_path, dst_path)
                 complete()
     else:
         queue = tf.train.input_producer(zip(src_paths, dst_paths), shuffle=False, num_epochs=1)
@@ -361,7 +399,11 @@ def main():
                         coord.request_stop()
                         break
 
-                    process(src_path, dst_path)
+                    if a.operation == "damage_random":
+                        process_damage_random(src_path, dst_path)
+                    else:
+                        process(src_path, dst_path)
+
                     complete()
 
         # init epoch counter for the queue
